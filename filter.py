@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-质检数据整理工具 v1.1
+质检数据整理工具 v1.2
 =================================================================
 功能：
   1. 读取《服务推诿.xlsx》  -> 提取字段（规则名：省统管控-服务推诿）
@@ -14,7 +14,7 @@ import sys
 
 # ===== 第一时间输出友好提示 =====
 sys.stdout.write("=" * 60 + "\n")
-sys.stdout.write("  质检数据整理工具 v1.1\n")
+sys.stdout.write("  质检数据整理工具 v1.2\n")
 sys.stdout.write("=" * 60 + "\n")
 sys.stdout.write(">> 程序正在初始化，请稍候...\n")
 sys.stdout.write("   (正在解压依赖库，启动可能需要 20-30 秒)\n")
@@ -84,6 +84,11 @@ HEADER_HEIGHT = 30
 
 LIGHT_RED = "FFC7CE"
 
+# ★ 需要特殊替换的门店名映射
+STORE_NAME_REPLACE = {
+    "中山市全球通大厦服营厅": "全球通大厦营业厅",
+}
+
 
 # ------------------------------------------------------------------
 # 工具函数
@@ -97,15 +102,31 @@ def clean_text(v) -> str:
     return "" if s.lower() in ("nan", "nat", "none") else s
 
 
-def norm_store_name(name: str) -> str:
-    """门店名称归一化，用于提高匹配成功率"""
+def clean_store_display(name: str) -> str:
+    """
+    ★ 门店名称展示用清理：
+      仅对映射表里指定的名称做特殊替换（当前只有“中山市全球通大厦服营厅”），
+      其他门店名一律原样返回。
+    """
     s = clean_text(name)
+    if not s:
+        return ""
+    return STORE_NAME_REPLACE.get(s, s)
+
+
+def norm_store_name(name: str) -> str:
+    """
+    门店名称归一化，用于提高匹配成功率：
+      - 先走 clean_store_display（只处理特殊映射）
+      - 去空格、括号、破折号、标点
+      - “服营厅/服务厅” -> “营业厅”
+    """
+    s = clean_store_display(name)
     if not s:
         return ""
     s = s.replace("（", "(").replace("）", ")")
     s = re.sub(r"[\s\-—_()（）【】\[\]、,，.。/\\]", "", s)
     s = s.replace("服营厅", "营业厅").replace("服务厅", "营业厅")
-    s = s.replace("中山市", "").replace("中山", "")
     return s
 
 
@@ -145,7 +166,8 @@ def build_part(df: pd.DataFrame, rule_name: str) -> pd.DataFrame:
     def get(col):
         return df[col] if col in df.columns else pd.Series([""] * len(df), index=df.index)
 
-    out["所在门店"]   = get("所在门店").map(clean_text)
+    # ★ 所在门店先做展示清理（仅处理映射表里的特殊名称），再输出 & 后续匹配
+    out["所在门店"]   = get("所在门店").map(clean_store_display)
     out["所属大商"]   = ""                                   # 后续由营业厅清单回填
     out["岗位名称"]   = get("岗位名称").map(clean_text)
     out["声音来源"]   = get("声音来源").map(clean_text)
