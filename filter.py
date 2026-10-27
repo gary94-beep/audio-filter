@@ -55,8 +55,8 @@ OPENNEW_FILE       = "开新降旧.xlsx"
 STORE_FILE_PATTERN = "*有效营业厅清单*.xlsx"
 OUTPUT_SUFFIX      = "开新降旧+服务推诿.xlsx"
 
-RULE_SERVICE = "省统管控-服务推诿"
-RULE_OPENNEW = "省统管控-开新降旧（优化试点）"
+RULE_SERVICE = "省统-服务-服务推诿"
+RULE_OPENNEW = "省统-营销-开新降旧"
 
 OUTPUT_COLUMNS = [
     "所在门店",
