@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-质检数据整理工具 v2.1
+质检数据整理工具 v3.1
 =================================================================
 功能：
-  1. 扫描目录下以规则名开头的明细表（模糊匹配），有则处理、无则跳过
-  2. 读取《xxxx有效营业厅清单.xlsx》 -> 按门店名匹配，回填 分公司/网格/所属大商/特权
-  3. 规则名称列按规则用不同浅色填充区分
+  1. 从程序所在目录读取 ad-config.json 获取规则清单；
+     读不到/读失败/结构无效 -> 自动回退内置默认配置
+  2. 扫描目录下以规则名开头的明细表（前缀模糊匹配），有则处理、无则跳过
+  3. 读取《xxxx有效营业厅清单.xlsx》 -> 按门店名匹配，回填 分公司/网格/所属大商/特权
+  4. 规则名称列按规则用不同浅色填充区分
 =================================================================
 """
 
@@ -13,7 +15,7 @@ import os
 import sys
 
 sys.stdout.write("=" * 60 + "\n")
-sys.stdout.write("  质检数据整理工具 v2.1\n")
+sys.stdout.write("  质检数据整理工具 v2.3\n")
 sys.stdout.write("=" * 60 + "\n")
 sys.stdout.write(">> 程序正在初始化，请稍候...\n")
 sys.stdout.write("   (正在解压依赖库，启动可能需要 20-30 秒)\n")
@@ -21,6 +23,7 @@ sys.stdout.write("-" * 60 + "\n")
 sys.stdout.flush()
 
 import glob
+import json
 import re
 import time
 import shutil
@@ -33,9 +36,17 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-def get_base_dir():
+# ------------------------------------------------------------------
+# 路径工具
+# ------------------------------------------------------------------
+def get_base_dir() -> str:
+    """
+    EXE 所在目录（打包后）或脚本所在目录（源码运行）。
+    PyInstaller --onefile 下 sys.executable 指向用户双击的 EXE 真实路径，
+    不受临时解压目录和 cwd 影响。
+    """
     if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(sys.executable))
     else:
         return os.path.dirname(os.path.abspath(__file__))
 
@@ -43,9 +54,10 @@ def get_base_dir():
 # ------------------------------------------------------------------
 # 配置区
 # ------------------------------------------------------------------
-# ★ 规则清单：输出时按此顺序拼接。
-#   文件名只要以规则名开头即可（如「省统-营销-保险推荐_20261110.xlsx」也能识别）。
-RULE_FILES = [
+CONFIG_FILE = "ad-config.json"
+
+# ★ 内置默认规则清单（配置文件读取失败时使用）
+DEFAULT_RULE_FILES = [
     "省统-营销-保险推荐",
     "中山-营销-亲情网",
     "省统-回捞-降档挽留",
@@ -106,6 +118,60 @@ RULE_FILL_COLORS = [
     "E4DFEC",  # 浅藕荷
     "D9E1F2",  # 浅蓝灰
 ]
+
+
+# ------------------------------------------------------------------
+# 配置加载：只从程序所在目录读 ad-config.json，失败一律回退默认
+# ------------------------------------------------------------------
+def load_rule_files(base_dir: str):
+    """
+    返回 (rule_files, source_desc)
+      - 只读取 <base_dir>/ad-config.json
+      - 不存在 / JSON 语法错 / 顶层非对象 / 缺 rule_files / 数组清洗后为空
+        -> 一律回退 DEFAULT_RULE_FILES
+    """
+    path = os.path.join(base_dir, CONFIG_FILE)
+
+    # ---- 情况 1：文件不存在 ----
+    if not os.path.isfile(path):
+        print(f"[配置] 未找到配置文件：{path}")
+        print(f"[配置] 使用内置默认规则清单")
+        return DEFAULT_RULE_FILES[:], "内置默认"
+
+    # ---- 情况 2：读取 / 解析失败 ----
+    print(f"[配置] 读取：{path}")
+    try:
+        # utf-8-sig 兼容记事本/VS Code 保存的带 BOM 文件
+        with open(path, "r", encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+    except Exception as e:
+        print(f"[配置] 读取失败：{e}")
+        print(f"[配置] 已回退到内置默认规则清单")
+        return DEFAULT_RULE_FILES[:], "内置默认（读取失败）"
+
+    # ---- 情况 3：结构无效 ----
+    if not isinstance(cfg, dict):
+        print(f"[配置] 顶层不是对象，已回退内置默认")
+        return DEFAULT_RULE_FILES[:], "内置默认（结构错误）"
+
+    rules = cfg.get("rule_files")
+    if not isinstance(rules, list):
+        print(f"[配置] 缺少 rule_files 数组，已回退内置默认")
+        return DEFAULT_RULE_FILES[:], "内置默认（缺少 rule_files）"
+
+    # ---- 情况 4：清洗（去空、去重、转字符串）----
+    cleaned, seen = [], set()
+    for r in rules:
+        s = str(r).strip()
+        if s and s not in seen:
+            seen.add(s)
+            cleaned.append(s)
+
+    if not cleaned:
+        print(f"[配置] rule_files 清洗后为空，已回退内置默认")
+        return DEFAULT_RULE_FILES[:], "内置默认（rule_files 为空）"
+
+    return cleaned, path
 
 
 # ------------------------------------------------------------------
@@ -250,20 +316,17 @@ def lookup_store(store_name: str, index: dict):
 # ------------------------------------------------------------------
 # 3. 扫描规则文件（前缀模糊匹配）
 # ------------------------------------------------------------------
-def discover_rule_files(base_dir: str) -> list:
+def discover_rule_files(base_dir: str, rule_files: list) -> list:
     """
     扫描 base_dir 下所有 .xlsx，文件名以某个规则名开头即视为该规则。
-    返回 [(规则名, 文件路径), ...]，按 RULE_FILES 顺序排列。
-    同一规则若命中多个文件，取第一个（按文件名排序）。
+    返回 [(规则名, 文件路径), ...]，按 rule_files 顺序排列。
     """
-    # 列出目录下所有 xlsx（排除输出文件、营业厅清单、临时文件）
     all_xlsx = []
     for p in glob.glob(os.path.join(base_dir, "*.xlsx")):
         fname = os.path.basename(p)
         if fname.startswith("~$"):          # Excel 临时文件
             continue
-        if STORE_FILE_PATTERN.strip("*").replace("*", "") and \
-           fname.endswith("有效营业厅清单.xlsx"):
+        if fname.endswith("有效营业厅清单.xlsx"):
             continue
         if fname.endswith(OUTPUT_SUFFIX):
             continue
@@ -271,14 +334,7 @@ def discover_rule_files(base_dir: str) -> list:
     all_xlsx.sort()
 
     ordered = []
-    for rule in RULE_FILES:
-        matched = [p for p in all_xlsx
-                   if os.path.basename(p).startswith(rule + ".") or
-                      os.path.basename(p).startswith(rule + "_") or
-                      os.path.basename(p).startswith(rule + "-") or
-                      os.path.basename(p).startswith(rule) and
-                      os.path.splitext(os.path.basename(p))[0].startswith(rule)]
-        # 上面条件可简化为一个：basename 去掉 .xlsx 后以 rule 开头
+    for rule in rule_files:
         matched = [p for p in all_xlsx
                    if os.path.splitext(os.path.basename(p))[0].startswith(rule)]
         if matched:
@@ -352,7 +408,6 @@ def format_worksheet(ws, df: pd.DataFrame, rule_color_map: dict):
     light_red_fill = PatternFill("solid", fgColor=LIGHT_RED)
     data_align = Alignment(vertical="center", wrap_text=True, horizontal="left")
 
-    # 预构建规则 -> PatternFill 对象
     rule_fills = {
         name: PatternFill("solid", fgColor=color)
         for name, color in rule_color_map.items()
@@ -382,6 +437,23 @@ def format_worksheet(ws, df: pd.DataFrame, rule_color_map: dict):
 
 
 # ------------------------------------------------------------------
+# 临时目录（避开中文路径风险）
+# ------------------------------------------------------------------
+def setup_temp_dir():
+    """把 openpyxl / tempfile 的临时目录指到系统 temp（英文路径最稳）"""
+    try:
+        sys_temp = tempfile.gettempdir()
+        app_temp = os.path.join(sys_temp, "qc_tool_tmp")
+        os.makedirs(app_temp, exist_ok=True)
+        os.environ['OPENPYXL_TMP_DIR'] = app_temp
+        tempfile.tempdir = app_temp
+        return app_temp
+    except Exception as e:
+        print(f"[警告] 设置临时目录失败，使用系统默认：{e}")
+        return None
+
+
+# ------------------------------------------------------------------
 # 主流程
 # ------------------------------------------------------------------
 def main():
@@ -391,23 +463,22 @@ def main():
     os.chdir(base_dir)
     print(f"\n[工作目录] {base_dir}\n")
 
-    temp_dir = os.path.join(base_dir, "openpyxl_temp")
-    try:
-        os.makedirs(temp_dir, exist_ok=True)
-        os.environ['OPENPYXL_TMP_DIR'] = temp_dir
-        tempfile.tempdir = temp_dir
-    except Exception as e:
-        print(f"[警告] 设置临时目录失败，将使用系统默认：{e}")
+    # ============ 加载规则清单（优先配置文件） ============
+    rule_files_cfg, cfg_source = load_rule_files(base_dir)
+    print(f"[配置] 规则清单共 {len(rule_files_cfg)} 项，来源：{cfg_source}\n")
+
+    # ============ 临时目录 ============
+    temp_dir = setup_temp_dir()
 
     # ============ 步骤 1：扫描规则文件 ============
     print("=" * 60)
     print("步骤 1/3：扫描规则明细表（前缀模糊匹配）")
     print("=" * 60)
-    rule_files = discover_rule_files(base_dir)
+    rule_files = discover_rule_files(base_dir, rule_files_cfg)
     if not rule_files:
         print("[错误] 未找到任何规则明细表。")
         print(f"   请在 EXE 同目录放置以下列名称开头的 xlsx 文件：")
-        for n in RULE_FILES:
+        for n in rule_files_cfg:
             print(f"     - {n}*.xlsx")
         input("按 Enter 键退出...")
         return
@@ -437,7 +508,6 @@ def main():
             print(f"  [成功] {name}：{len(part)} 条")
         except Exception as e:
             print(f"  [失败] {name}：{e}")
-            # 单文件失败不阻断整体流程
     if not parts:
         print("[错误] 所有规则文件都读取失败。")
         input("按 Enter 键退出...")
@@ -508,11 +578,12 @@ def main():
         input("按 Enter 键退出...")
         return
 
+    # 清理临时目录（系统 temp 下，删不掉也不影响）
     try:
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-    except Exception as e:
-        print(f"[警告] 清理临时目录失败：{e}")
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    except Exception:
+        pass
 
     elapsed = time.time() - start_time
     print("\n" + "=" * 60)
